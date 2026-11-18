@@ -10,8 +10,8 @@ int main(int argc, char* argv[]) {
 
     try {
         PcapReader reader;
-        const std::size_t count = reader.read(path, std::cout);
-        std::cout << "Total packets: " << count << '\n';
+        const std::size_t total = reader.read(path, std::cout);
+        std::cout << "Total packets: " << total << '\n';
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
