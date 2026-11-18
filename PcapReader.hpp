@@ -1,88 +1,126 @@
 #pragma once
 
-#include <pcap/pcap.h>
 #include <arpa/inet.h>
+#include <pcap/pcap.h>
+
 #include <cstddef>
 #include <iomanip>
-#include <iostream>
 #include <memory>
+#include <ostream>
 #include <stdexcept>
 #include <string>
 
 class PcapReader {
+private:
+    // Двухбайтовое поле в сетевом порядке: сначала старший байт.
+    static unsigned read16(const u_char* p) {
+        return (static_cast<unsigned>(p[0]) << 8) | p[1];
+    }
+
 public:
     std::size_t read(const std::string& path, std::ostream& output) const {
         char error[PCAP_ERRBUF_SIZE]{};
 
-        // pcap_close вызовется автоматически при выходе из метода.
         std::unique_ptr<pcap_t, decltype(&pcap_close)> capture(
             pcap_open_offline(path.c_str(), error), &pcap_close
         );
 
         if (!capture) {
-            throw std::runtime_error(
-                "Cannot open " + path + ": " + error
-            );
+            throw std::runtime_error("Cannot open " + path + ": " + error);
         }
+
+        const bool isEthernet = pcap_datalink(capture.get()) == DLT_EN10MB;
+
+        std::size_t count = 0;
+        std::size_t ipv4Count = 0;
+        std::size_t ipv6Count = 0;
+        std::size_t arpCount = 0;
 
         pcap_pkthdr* header = nullptr;
         const u_char* data = nullptr;
-        std::size_t count = 0;
-std::size_t ipv4Count = 0;
-int status;
+        int status;
 
-const bool isEthernet = pcap_datalink(capture.get()) == DLT_EN10MB;
-constexpr std::size_t ethernetSize = 14;
-constexpr std::size_t minIpv4Size = 20;
+        while ((status = pcap_next_ex(capture.get(), &header, &data)) == 1) {
+            ++count;
 
-while ((status = pcap_next_ex(capture.get(), &header, &data)) == 1) {
-    ++count;
-    
+            // Адрес IPv6 в текстовом виде длиннее IPv4.
+            char source[INET6_ADDRSTRLEN]{};
+            char destination[INET6_ADDRSTRLEN]{};
+            const char* addressLabel = nullptr;
 
-    char source[INET_ADDRSTRLEN]{};
-    char destination[INET_ADDRSTRLEN]{};
-    bool hasIpv4Addresses = false;
+            const std::size_t size = header->caplen;
 
-    // Разбираем каждый пакет. EtherType 0x0800 означает IPv4.
-    if (isEthernet &&
-        header->caplen >= ethernetSize + minIpv4Size &&
-        data[12] == 0x08 && data[13] == 0x00) {
-        const u_char* ip = data + ethernetSize;
-        const std::size_t ipHeaderSize = (ip[0] & 0x0F) * 4;
+            if (isEthernet && size >= 14) {
+                unsigned etherType = read16(data + 12);
+                std::size_t offset = 14;
 
-        if ((ip[0] >> 4) == 4 &&
-            ipHeaderSize >= minIpv4Size &&
-            header->caplen >= ethernetSize + ipHeaderSize) {
-            hasIpv4Addresses =
-                inet_ntop(AF_INET, ip + 12, source, sizeof(source)) != nullptr &&
-                inet_ntop(AF_INET, ip + 16, destination, sizeof(destination)) != nullptr;
+                // Каждый VLAN-тег занимает 4 байта.
+                while ((etherType == 0x8100 || etherType == 0x88A8) &&
+                       size - offset >= 4) {
+                    etherType = read16(data + offset + 2);
+                    offset += 4;
+                }
 
-            if (hasIpv4Addresses) {
-                ++ipv4Count;
+                const u_char* payload = data + offset;
+                const std::size_t remaining = size - offset;
+
+                if (etherType == 0x0800 && remaining >= 20 &&
+                    (payload[0] >> 4) == 4) {
+                    const std::size_t headerSize = (payload[0] & 0x0F) * 4;
+
+                    if (headerSize >= 20 && remaining >= headerSize &&
+                        inet_ntop(AF_INET, payload + 12, source, sizeof(source)) &&
+                        inet_ntop(AF_INET, payload + 16, destination, sizeof(destination))) {
+                        addressLabel = "IPv4";
+                        ++ipv4Count;
+                    }
+                } else if (etherType == 0x86DD && remaining >= 40 &&
+                           (payload[0] >> 4) == 6) {
+                    if (inet_ntop(AF_INET6, payload + 8, source, sizeof(source)) &&
+                        inet_ntop(AF_INET6, payload + 24, destination, sizeof(destination))) {
+                        addressLabel = "IPv6";
+                        ++ipv6Count;
+                    }
+                } else if (etherType == 0x0806 && remaining >= 28 &&
+                           read16(payload) == 1 && read16(payload + 2) == 0x0800 &&
+                           payload[4] == 6 && payload[5] == 4) {
+                    // ARP поверх Ethernet: IPv4 отправителя и целевого узла.
+                    if (inet_ntop(AF_INET, payload + 14, source, sizeof(source)) &&
+                        inet_ntop(AF_INET, payload + 24, destination, sizeof(destination))) {
+                        addressLabel = "ARP sender/target";
+                        ++arpCount;
+                    }
+                }
+            }
+
+            if (count <= 5) {
+                output << "Packet " << count
+                       << " | time: " << header->ts.tv_sec << '.'
+                       << std::setfill('0') << std::setw(6)
+                       << header->ts.tv_usec << std::setfill(' ')
+                       << " | captured: " << header->caplen << " bytes"
+                       << " | original: " << header->len << " bytes";
+
+                if (addressLabel != nullptr) {
+                    output << " | " << addressLabel << ": "
+                           << source << " -> " << destination;
+                }
+
+                output << '\n';
             }
         }
-    }
 
-    // Ограничиваем только вывод в терминал.
-    if (count <= 5) {
-        output << "Packet " << count
-               << " | time: " << header->ts.tv_sec << '.'
-               << std::setfill('0') << std::setw(6)
-               << header->ts.tv_usec << std::setfill(' ')
-               << " | captured: " << header->caplen << " bytes"
-               << " | original: " << header->len << " bytes";
-
-        if (hasIpv4Addresses) {
-            output << " | IP: " << source << " -> " << destination;
+        if (status != PCAP_ERROR_BREAK) {
+            throw std::runtime_error(pcap_geterr(capture.get()));
         }
 
-        output << '\n';
-    }
-}
-if (status != PCAP_ERROR_BREAK) {
-        throw std::runtime_error(pcap_geterr(capture.get()));
-    }
-    output << "IPv4 packets with parsed addresses: " << ipv4Count << '\n';
+        const std::size_t withoutPair = count - ipv4Count - ipv6Count - arpCount;
+
+        output << "IPv4 packets: " << ipv4Count << '\n'
+               << "IPv6 packets: " << ipv6Count << '\n'
+               << "ARP packets with IPv4 sender/target: " << arpCount << '\n'
+               << "Packets without a parsed address pair: " << withoutPair << '\n';
+
         return count;
     }
 };

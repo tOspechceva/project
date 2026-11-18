@@ -1,5 +1,10 @@
 #include "PcapReader.hpp"
 
+#include <cstddef>
+#include <exception>
+#include <iostream>
+#include <string>
+
 int main(int argc, char* argv[]) {
     const std::string path = argc > 1 ? argv[1] : "FIRST-2015-merged.pcap";
 
